@@ -1,1 +1,1 @@
-# Placeholder - will be replaced with actual content
+placeholder
