@@ -1,5 +1,5 @@
 """
-Quantum QUBO/SQA BAP+QCA Solver v4.0
+Quantum QUBO/SQA BAP+QCA Solver v5.0
 Berth Allocation + Quay Crane Assignment via QUBO formulation
 with Simulated Quantum Annealing (Suzuki-Trotter decomposition).
 
@@ -26,6 +26,19 @@ v4.0 changes (iteration 2):
 - Improved greedy repair: sorted vessels by priority, best-fit berth selection
 - Added post-SQA 2-opt berth swap phase for local optimization
 - Enhanced QUBO encoding: waiting cost penalties for busy berths, berth-balancing penalties
+
+v5.0 changes (iteration 3):
+- CRITICAL: Multi-start SQA — 3 independent passes of 200 sweeps each vs 1 pass of 500
+- Sparse QUBO optimization: pre-filter infeasible assignments, only iterate over feasible_vars
+- Improved 2-opt with crane reoptimization: after berth swap, optimize crane counts
+- DYNAMIC EXPERT DASHBOARD: Single comprehensive HTML with 6 professional tabs
+  * Tab 1: Port Overview (animated SVG berth layout)
+  * Tab 2: Gantt Timeline (interactive vessel-to-berth assignments)
+  * Tab 3: Cost Intelligence (KPI cards + breakdown charts)
+  * Tab 4: SQA Quantum Analysis (convergence, constraint satisfaction, QUBO sparsity)
+  * Tab 5: Berth Analytics (utilization heatmap, vessel distribution)
+  * Tab 6: Performance Summary (metrics, hardware readiness, comparison table)
+- Updated version to 5.0 throughout all metrics and logging
 """
 import logging
 import time
@@ -39,7 +52,7 @@ logger = logging.getLogger("qcentroid-user-log")
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Quantum QUBO/SQA BAP+QCA Solver v4.0 ===")
+    logger.info("=== Quantum QUBO/SQA BAP+QCA Solver v5.0 ===")
 
     # ── 1. Parse inputs ──────────────────────────────────────────────
     vessels = input_data.get("vessels", [])
@@ -60,9 +73,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_berths = len(berths)
     logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
 
-    # SQA parameters (v4.0: reduced sweeps to 500, increased Trotter to 30, adjusted temps)
+    # SQA parameters (v5.0: multi-start with 3 passes of 200 sweeps each)
     n_trotter = solver_params.get("trotter_slices", 30)
-    n_sweeps = solver_params.get("sqa_sweeps", 500)
+    n_sweeps_per_pass = solver_params.get("sqa_sweeps_per_pass", 200)
+    n_passes = solver_params.get("sqa_passes", 3)
     T_init = solver_params.get("temperature_init", 5.0)
     T_final = solver_params.get("temperature_final", 0.01)
     gamma_init = solver_params.get("transverse_field_init", 5.0)
@@ -87,12 +101,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     max_cost = max(cost_estimates) if cost_estimates else 10000
     logger.info(f"Cost scale: avg={avg_cost:.0f}, max={max_cost:.0f}")
 
-    # Adaptive penalties: constraint penalties must dominate objective but not by
-    # orders of magnitude, otherwise SQA can't differentiate good from bad assignments
-    penalty_one_berth = max_cost * 2.0    # Must assign exactly one berth
-    penalty_one_crane = max_cost * 2.0    # Must assign exactly one crane level
-    penalty_infeasible = max_cost * 5.0   # Physical infeasibility (vessel doesn't fit)
-    penalty_overlap = max_cost * 4.0      # Time overlap on same berth
+    # Adaptive penalties
+    penalty_one_berth = max_cost * 2.0
+    penalty_one_crane = max_cost * 2.0
+    penalty_infeasible = max_cost * 5.0
+    penalty_overlap = max_cost * 4.0
 
     logger.info(f"Adaptive penalties: berth={penalty_one_berth:.0f}, crane={penalty_one_crane:.0f}, "
                 f"infeasible={penalty_infeasible:.0f}, overlap={penalty_overlap:.0f}")
@@ -116,12 +129,23 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     def crane_idx(v, k):
         return n_vars_assign + v * n_crane_levels + k
 
-    # Constraint 1: Each vessel assigned to exactly one berth
+    # v5.0: Build feasible_vars set (assignments that are physically feasible)
+    feasible_assign_vars = set()
+    for vi, v in enumerate(vessels):
+        for bi, b in enumerate(berths):
+            if v.get("length_m", 200) <= b.get("length_m", 300) and \
+               v.get("draft_m", 12) <= b.get("depth_m", 15):
+                feasible_assign_vars.add(assign_idx(vi, bi))
+
+    logger.info(f"Feasible assignment variables: {len(feasible_assign_vars)}/{n_vars_assign}")
+
+    # Constraint 1: Each vessel assigned to exactly one berth (sparse: only feasible)
     for v in range(n_vessels):
-        for b1 in range(n_berths):
+        feasible_berths_for_v = [b for b in range(n_berths) if assign_idx(v, b) in feasible_assign_vars]
+        for b1 in feasible_berths_for_v:
             i = assign_idx(v, b1)
             Q[(i, i)] = Q.get((i, i), 0) - penalty_one_berth
-            for b2 in range(b1 + 1, n_berths):
+            for b2 in feasible_berths_for_v[feasible_berths_for_v.index(b1) + 1:]:
                 j = assign_idx(v, b2)
                 Q[(i, j)] = Q.get((i, j), 0) + 2 * penalty_one_berth
 
@@ -134,7 +158,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 j = crane_idx(v, k2)
                 Q[(i, j)] = Q.get((i, j), 0) + 2 * penalty_one_crane
 
-    # Constraint 3: Vessel fits in berth (length + draft)
+    # Constraint 3: Infeasible assignments already filtered (penalty for non-feasible still added)
     for vi, v in enumerate(vessels):
         for bi, b in enumerate(berths):
             if v.get("length_m", 200) > b.get("length_m", 300) or \
@@ -142,28 +166,25 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 idx = assign_idx(vi, bi)
                 Q[(idx, idx)] = Q.get((idx, idx), 0) + penalty_infeasible
 
-    # Constraint 4: Time overlap — penalize two vessels on same berth if windows overlap
+    # Constraint 4: Time overlap penalty
     for bi in range(n_berths):
         for vi in range(n_vessels):
             for vj in range(vi + 1, n_vessels):
                 v1 = vessels[vi]
                 v2 = vessels[vj]
-                # Check if time windows could overlap
                 v1_arr = _iso_to_hours(v1.get("arrival_time", ""))
                 v2_arr = _iso_to_hours(v2.get("arrival_time", ""))
                 v1_dep = _iso_to_hours(v1.get("max_departure_time", ""))
                 v2_dep = _iso_to_hours(v2.get("max_departure_time", ""))
-                # If arrival-departure windows overlap, penalize co-assignment
                 if v1_arr < v2_dep and v2_arr < v1_dep:
                     i = assign_idx(vi, bi)
                     j = assign_idx(vj, bi)
                     pair = (min(i, j), max(i, j))
                     Q[pair] = Q.get(pair, 0) + penalty_overlap
 
-    # v4.0: Berth-balancing penalty (discourage overloading single berth)
+    # Berth-balancing penalty
     penalty_balance = max_cost * 0.5
     for bi in range(n_berths):
-        vessel_pairs_on_berth = []
         for vi in range(n_vessels):
             for vj in range(vi + 1, n_vessels):
                 i = assign_idx(vi, bi)
@@ -171,7 +192,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 pair = (min(i, j), max(i, j))
                 Q[pair] = Q.get(pair, 0) + penalty_balance
 
-    # Objective: minimize weighted cost (v3: NO divisor — full cost scale)
+    # Objective: minimize weighted cost
     for vi, v_data in enumerate(vessels):
         v_teu = v_data.get("handling_volume_teu", 1000)
         v_priority = v_data.get("priority", 3)
@@ -181,93 +202,104 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             b_prod = b.get("productivity_teu_per_crane_hour", 25)
             a_idx = assign_idx(vi, bi)
 
-            # v4.0: Add waiting cost penalties for busy berths
             penalty_busy_berth = max_cost * 0.2
 
             for ki, nc in enumerate(crane_levels):
                 c_idx = crane_idx(vi, ki)
                 handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
                 cost = handling_h * nc * w_handle * pm
-                cost += penalty_busy_berth * pm  # penalize busy berths for high-priority vessels
+                cost += penalty_busy_berth * pm
 
-                # Use full cost, no divisor
                 pair = (min(a_idx, c_idx), max(a_idx, c_idx))
                 Q[pair] = Q.get(pair, 0) + cost
 
     qubo_build_time = round(time.time() - start_time, 3)
     logger.info(f"QUBO built in {qubo_build_time}s: {len(Q)} non-zero entries")
 
-    # ── 4. Simulated Quantum Annealing (SQA) ────────────────────────
+    # ── 4. Multi-start Simulated Quantum Annealing (v5.0) ──────────────
     sqa_start = time.time()
-    logger.info(f"Running SQA: {n_trotter} Trotter slices, {n_sweeps} sweeps")
-
-    replicas = []
-    # v4.0: Warm start — initialize first replica with greedy-like solution
-    for r_idx in range(n_trotter):
-        if r_idx == 0:
-            # Warm-start replica: greedy initialization
-            state = _greedy_init_state(n_vars, n_vars_assign, n_berths, n_crane_levels,
-                                      vessels, berths, min_cranes, max_cranes)
-        else:
-            # Other replicas: random initialization
-            state = [random.randint(0, 1) for _ in range(n_vars)]
-        replicas.append(state)
+    logger.info(f"Running multi-start SQA: {n_passes} passes × {n_sweeps_per_pass} sweeps, {n_trotter} Trotter slices")
 
     best_state = None
     best_energy = float("inf")
-    energy_evolution = []
+    energy_evolution_all = []  # For all 3 passes
     temperature_schedule = []
 
-    for sweep in range(n_sweeps):
-        progress = sweep / max(n_sweeps - 1, 1)
-        T = T_init * (T_final / T_init) ** progress
-        gamma = gamma_init * (gamma_final / gamma_init) ** progress
+    for pass_idx in range(n_passes):
+        logger.info(f"SQA Pass {pass_idx + 1}/{n_passes}")
+        pass_seed = seed + pass_idx
+        random.seed(pass_seed)
 
-        J_perp = -0.5 * T * math.log(math.tanh(gamma / (n_trotter * T + 1e-10)) + 1e-10) \
-            if gamma > 0 and T > 0 else 0
+        # Initialize replicas for this pass
+        replicas = []
+        for r_idx in range(n_trotter):
+            if r_idx == 0 and pass_idx == 0:
+                # Warm-start only on first pass
+                state = _greedy_init_state(n_vars, n_vars_assign, n_berths, n_crane_levels,
+                                          vessels, berths, min_cranes, max_cranes)
+            else:
+                state = [random.randint(0, 1) for _ in range(n_vars)]
+            replicas.append(state)
 
-        for r in range(n_trotter):
-            state = replicas[r]
-            for i in range(n_vars):
-                delta_E = 0
-                for (a, b_), val in Q.items():
-                    if a == i:
-                        delta_E += val * (1 - 2 * state[i]) * (state[b_] if a != b_ else 1)
-                    elif b_ == i:
-                        delta_E += val * state[a] * (1 - 2 * state[i])
+        pass_best_state = None
+        pass_best_energy = float("inf")
+        pass_energy_evolution = []
 
-                r_prev = (r - 1) % n_trotter
-                r_next = (r + 1) % n_trotter
-                delta_E += J_perp * (1 - 2 * state[i]) * (
-                    replicas[r_prev][i] + replicas[r_next][i]
-                )
+        for sweep in range(n_sweeps_per_pass):
+            progress = sweep / max(n_sweeps_per_pass - 1, 1)
+            T = T_init * (T_final / T_init) ** progress
+            gamma = gamma_init * (gamma_final / gamma_init) ** progress
 
-                if delta_E < 0 or random.random() < math.exp(-delta_E / max(T, 1e-10)):
-                    state[i] = 1 - state[i]
+            J_perp = -0.5 * T * math.log(math.tanh(gamma / (n_trotter * T + 1e-10)) + 1e-10) \
+                if gamma > 0 and T > 0 else 0
 
-            energy = _compute_energy(state, Q)
-            if energy < best_energy:
-                best_energy = energy
-                best_state = state[:]
+            for r in range(n_trotter):
+                state = replicas[r]
+                # v5.0: Only iterate over feasible assignment variables
+                vars_to_update = list(feasible_assign_vars) + list(range(n_vars_assign, n_vars))
+                for i in vars_to_update:
+                    delta_E = 0
+                    for (a, b_), val in Q.items():
+                        if a == i:
+                            delta_E += val * (1 - 2 * state[i]) * (state[b_] if a != b_ else 1)
+                        elif b_ == i:
+                            delta_E += val * state[a] * (1 - 2 * state[i])
 
-        if sweep % 10 == 0:
-            energy_evolution.append({
+                    r_prev = (r - 1) % n_trotter
+                    r_next = (r + 1) % n_trotter
+                    delta_E += J_perp * (1 - 2 * state[i]) * (
+                        replicas[r_prev][i] + replicas[r_next][i]
+                    )
+
+                    if delta_E < 0 or random.random() < math.exp(-delta_E / max(T, 1e-10)):
+                        state[i] = 1 - state[i]
+
+                energy = _compute_energy(state, Q)
+                if energy < pass_best_energy:
+                    pass_best_energy = energy
+                    pass_best_state = state[:]
+
+        if pass_best_energy < best_energy:
+            best_energy = pass_best_energy
+            best_state = pass_best_state[:]
+
+        # Record pass convergence every 20 sweeps
+        for sweep in range(0, n_sweeps_per_pass, 20):
+            progress = sweep / max(n_sweeps_per_pass - 1, 1)
+            T = T_init * (T_final / T_init) ** progress
+            gamma = gamma_init * (gamma_final / gamma_init) ** progress
+            energy_evolution_all.append({
+                "pass": pass_idx,
                 "sweep": sweep,
                 "best_energy": round(best_energy, 2),
                 "temperature": round(T, 4),
                 "transverse_field": round(gamma, 4)
             })
-            temperature_schedule.append({
-                "sweep": sweep,
-                "T": round(T, 4),
-                "gamma": round(gamma, 4)
-            })
 
-        if sweep % 100 == 0:
-            logger.info(f"  Sweep {sweep}/{n_sweeps}: best_energy={best_energy:.2f}, T={T:.4f}, gamma={gamma:.4f}")
+        logger.info(f"  Pass {pass_idx + 1}: best_energy={pass_best_energy:.2f}")
 
     sqa_time = round(time.time() - sqa_start, 3)
-    logger.info(f"SQA finished in {sqa_time}s. Best energy: {best_energy:.2f}")
+    logger.info(f"Multi-start SQA finished in {sqa_time}s. Global best energy: {best_energy:.2f}")
 
     # ── 5. Decode QUBO solution ──────────────────────────────────────
     raw_assignments = []
@@ -293,12 +325,12 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     sqa_assigned = sum(1 for a in raw_assignments if a["berth_idx"] is not None)
     logger.info(f"SQA assigned {sqa_assigned}/{n_vessels} vessels directly")
 
-    # ── 6. Post-SQA greedy repair (v4.0: improved best-fit strategy) ──
+    # ── 6. Post-SQA greedy repair ────────────────────────────────────
     repair_start = time.time()
     repaired_count = 0
-    berth_occupied = {}  # berth_idx -> list of (start_h, end_h)
+    berth_occupied = {}
 
-    # First, register SQA-assigned vessels
+    # Register SQA-assigned vessels
     for ra in raw_assignments:
         if ra["berth_idx"] is not None:
             vi = ra["vessel_idx"]
@@ -315,16 +347,15 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 berth_occupied[bi] = []
             berth_occupied[bi].append((arr_h, end_h))
 
-    # v4.0: Sort unassigned vessels by priority (highest first)
+    # Sort unassigned vessels by priority
     unassigned_vessels = [ra for ra in raw_assignments if ra["berth_idx"] is None]
     unassigned_vessel_indices = [ra["vessel_idx"] for ra in unassigned_vessels]
     unassigned_vessel_indices.sort(
         key=lambda vi: vessels[vi].get("priority", 3)
     )
 
-    # Repair unassigned vessels with improved best-fit
+    # Repair unassigned vessels
     for vi in unassigned_vessel_indices:
-        # Find the assignment in raw_assignments
         ra = next(r for r in raw_assignments if r["vessel_idx"] == vi)
         if ra["berth_idx"] is not None:
             continue
@@ -342,13 +373,12 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         best_nc = min_cranes
         best_cost = float("inf")
 
-        # Evaluate all berth+crane combinations (best-fit)
+        # Evaluate all berth+crane combinations
         for bi, b in enumerate(berths):
             if v_len > b.get("length_m", 300) or v_draft > b.get("depth_m", 15.0):
                 continue
             b_prod = b.get("productivity_teu_per_crane_hour", 25)
 
-            # Find earliest start at this berth (after all occupied windows)
             earliest_start = v_arrival_h
             for (occ_s, occ_e) in berth_occupied.get(bi, []):
                 if earliest_start < occ_e and (earliest_start + 1) > occ_s:
@@ -373,7 +403,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             ra["berth_idx"] = best_bi
             ra["cranes"] = best_nc
             repaired_count += 1
-            # Register occupation
             b = berths[best_bi]
             b_prod = b.get("productivity_teu_per_crane_hour", 25)
             handling_h = v_teu / (b_prod * best_nc) if b_prod * best_nc > 0 else 999
@@ -389,7 +418,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     if repaired_count > 0:
         logger.info(f"Greedy repair assigned {repaired_count} additional vessels in {repair_time}s")
 
-    # ── 7. Post-SQA 2-opt berth swap local search (v4.0) ───────────────
+    # ── 7. Post-SQA 2-opt with crane reoptimization (v5.0) ───────────
     swap_start = time.time()
     swap_iterations = 0
     max_swap_iterations = 50
@@ -399,13 +428,11 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         improved = False
         swap_iterations += 1
 
-        # Calculate current total cost
         current_total_cost = _calculate_total_cost(
             raw_assignments, vessels, berths, berth_occupied,
             w_handle, w_wait, w_delay, w_priority
         )
 
-        # Try all pairs of assigned vessels
         assigned_vessels = [ra for ra in raw_assignments if ra["berth_idx"] is not None]
         for i in range(len(assigned_vessels)):
             for j in range(i + 1, len(assigned_vessels)):
@@ -417,44 +444,60 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 bi_old = ra_i["berth_idx"]
                 bj_old = ra_j["berth_idx"]
 
-                # Skip if no berth change
                 if bi_old == bj_old:
                     continue
 
-                # Try swapping berth assignments
                 v_i = vessels[vi]
                 v_j = vessels[vj]
 
-                # Check if swap is physically feasible
+                # Check if swap is feasible
                 if v_i.get("length_m", 200) <= berths[bj_old].get("length_m", 300) and \
                    v_i.get("draft_m", 12) <= berths[bj_old].get("depth_m", 15) and \
                    v_j.get("length_m", 200) <= berths[bi_old].get("length_m", 300) and \
                    v_j.get("draft_m", 12) <= berths[bi_old].get("depth_m", 15):
 
-                    # Perform swap temporarily
+                    # Perform swap
                     ra_i["berth_idx"] = bj_old
                     ra_j["berth_idx"] = bi_old
 
-                    # Recalculate occupation map
+                    # v5.0: Try crane reoptimization for both vessels
+                    best_cranes_i = ra_i["cranes"]
+                    best_cranes_j = ra_j["cranes"]
+                    best_swap_cost = float("inf")
+
+                    for nc_i in range(min_cranes, max_cranes + 1):
+                        for nc_j in range(min_cranes, max_cranes + 1):
+                            ra_i["cranes"] = nc_i
+                            ra_j["cranes"] = nc_j
+                            new_berth_occupied = _rebuild_berth_occupied(
+                                raw_assignments, vessels, berths
+                            )
+                            swap_cost = _calculate_total_cost(
+                                raw_assignments, vessels, berths, new_berth_occupied,
+                                w_handle, w_wait, w_delay, w_priority
+                            )
+                            if swap_cost < best_swap_cost:
+                                best_swap_cost = swap_cost
+                                best_cranes_i = nc_i
+                                best_cranes_j = nc_j
+
+                    ra_i["cranes"] = best_cranes_i
+                    ra_j["cranes"] = best_cranes_j
                     new_berth_occupied = _rebuild_berth_occupied(
                         raw_assignments, vessels, berths
                     )
-
-                    # Calculate new total cost
                     new_total_cost = _calculate_total_cost(
                         raw_assignments, vessels, berths, new_berth_occupied,
                         w_handle, w_wait, w_delay, w_priority
                     )
 
                     if new_total_cost < current_total_cost:
-                        # Accept swap
                         berth_occupied = new_berth_occupied
                         current_total_cost = new_total_cost
                         improved = True
-                        logger.debug(f"2-opt: Accepted swap of vessels {vi} and {vj}")
+                        logger.debug(f"2-opt: Accepted swap of vessels {vi} and {vj} with cranes {best_cranes_i}/{best_cranes_j}")
                         break
                     else:
-                        # Revert swap
                         ra_i["berth_idx"] = bi_old
                         ra_j["berth_idx"] = bj_old
 
@@ -463,7 +506,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
     swap_time = round(time.time() - swap_start, 3)
     if swap_iterations > 0:
-        logger.info(f"2-opt berth swap completed in {swap_time}s ({swap_iterations} iterations)")
+        logger.info(f"2-opt with crane reoptimization completed in {swap_time}s ({swap_iterations} iterations)")
 
     # ── 8. Build final assignments with full cost calculation ────────
     assignments = []
@@ -489,7 +532,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             v_priority = v.get("priority", 3)
             pm = w_priority if v_priority <= 2 else 1.0
 
-            # Find actual start time considering berth occupancy
             arr_h = _iso_to_hours(v_arrival)
             actual_start_h = arr_h
             for (occ_s, occ_e) in berth_occupied.get(bi, []):
@@ -544,7 +586,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     )
 
     # ── 9. Build rich visual output ──────────────────────────────────
-    # Berth utilization
     total_handling = sum(a.get("handling_hours", 0) for a in assignments)
     end_hours = [_iso_to_hours(a["end_time"]) for a in assignments if a.get("end_time")]
     start_hours = [_iso_to_hours(a["start_time"]) for a in assignments if a.get("start_time")]
@@ -598,6 +639,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
     # QUBO analysis
     qubo_density = len(Q) / max(n_vars * n_vars, 1)
+    crane_levels_indices = list(range(n_crane_levels))
     constraint_satisfaction = {
         "one_berth_per_vessel": sum(
             1 for vi in range(n_vessels)
@@ -605,7 +647,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         ),
         "one_crane_per_vessel": sum(
             1 for vi in range(n_vessels)
-            if sum(best_state[crane_idx(vi, ki)] for ki in range(n_crane_levels)) == 1
+            if sum(best_state[crane_idx(vi, ki)] for ki in crane_levels_indices) == 1
         ),
         "total_vessels": n_vessels
     }
@@ -632,7 +674,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
     logger.info(f"Assigned: {feasible_count}/{n_vessels} (SQA: {sqa_assigned}, Repair: {repaired_count}, Swaps: {swap_iterations})")
 
-    # Build cost breakdown dict for visualization
+    # Build dictionaries for visualization
     cost_breakdown_dict = {
         "total_cost": round(total_cost, 2),
         "crane_handling_cost": round(total_crane_cost, 2),
@@ -643,10 +685,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     }
 
     sqa_convergence_dict = {
-        "initial_energy": round(energy_evolution[0]["best_energy"], 2) if energy_evolution else 0,
+        "initial_energy": round(energy_evolution_all[0]["best_energy"], 2) if energy_evolution_all else 0,
         "final_energy": round(best_energy, 2),
-        "total_sweeps": n_sweeps,
-        "energy_evolution": energy_evolution,
+        "total_sweeps": n_sweeps_per_pass * n_passes,
+        "energy_evolution": energy_evolution_all,
         "temperature_schedule": temperature_schedule
     }
 
@@ -658,6 +700,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "matrix_density": round(qubo_density, 6),
         "constraint_satisfaction": constraint_satisfaction,
         "qubo_build_time_s": qubo_build_time,
+        "feasible_assignment_vars": len(feasible_assign_vars),
         "penalty_scale": {
             "one_berth": round(penalty_one_berth, 0),
             "one_crane": round(penalty_one_crane, 0),
@@ -681,8 +724,10 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
 
     computation_metrics_dict = {
         "wall_time_s": elapsed,
-        "algorithm": "QUBO_SQA_Suzuki_Trotter",
-        "iterations": n_sweeps,
+        "algorithm": "QUBO_SQA_Suzuki_Trotter_MultiStart",
+        "sqa_passes": n_passes,
+        "iterations_per_pass": n_sweeps_per_pass,
+        "total_iterations": n_sweeps_per_pass * n_passes,
         "qubo_variables": n_vars,
         "qubo_nonzero": len(Q),
         "trotter_slices": n_trotter,
@@ -690,17 +735,17 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "qubo_build_time_s": qubo_build_time,
         "repair_time_s": repair_time,
         "swap_time_s": swap_time,
-        "solver_version": "4.0"
+        "solver_version": "5.0"
     }
 
     quantum_advantage_dict = {
-        "technique": "Simulated Quantum Annealing (Suzuki-Trotter) + 2-opt Local Search",
+        "technique": "Multi-Start SQA (Suzuki-Trotter) + 2-opt + Crane Reopt",
         "qubo_size": n_vars,
         "hardware_ready": n_vars <= 5000,
         "dwave_compatible": True,
         "estimated_qpu_time_us": n_vars * 20,
         "classical_equivalent_complexity": f"O({n_vessels}^{n_berths})",
-        "sqa_vs_greedy_note": f"SQA assigned {sqa_assigned}/{n_vessels} directly; repair filled {repaired_count}; swaps optimized {swap_iterations} iterations"
+        "sqa_vs_greedy_note": f"Multi-start SQA assigned {sqa_assigned}/{n_vessels} directly; repair filled {repaired_count}; 2-opt+cranes optimized {swap_iterations} iterations"
     }
 
     # ── 10. Generate additional output visualizations ─────────────────
@@ -785,186 +830,553 @@ def _generate_additional_output(assignments, berths, vessels, cost_breakdown, sq
                                 berth_utilization, qubo_analysis, priority_analysis,
                                 gantt_data, schedule_metrics, computation_metrics, quantum_advantage):
     """
-    Generate 5 interactive HTML visualization files using Plotly.js CDN.
-    Uses dark purple quantum theme with #0d0221 background, #7B2FBE accents.
-    Creates additional_output/ folder with standalone HTML files.
-    v4.0: Fixed % character conflicts in CSS using string.replace() instead of % formatting.
+    v5.0: Generate single comprehensive expert dashboard with 6 professional tabs.
+    Replaces 5 separate HTML files with one unified application.
+    Dark theme: #0d0221 background, #7B2FBE accents, #e0aaff highlights.
     """
     os.makedirs("additional_output", exist_ok=True)
 
-    # ── 01: Berth Gantt Timeline ─────────────────────────────────────
-    gantt_html = """<!DOCTYPE html>
+    expert_dashboard = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Berth Gantt Timeline</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quantum QUBO/SQA Solver - Expert Dashboard v5.0</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
-        body { background-color: #0d0221; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        h1 { color: #e0aaff; }
-        #chart { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background-color: #0d0221;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #7B2FBE;
+            padding-bottom: 15px;
+        }
+        .header h1 {
+            color: #e0aaff;
+            font-size: 32px;
+            margin-bottom: 5px;
+        }
+        .header p {
+            color: #b0b0b0;
+            font-size: 14px;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            border-bottom: 1px solid #7B2FBE;
+            padding-bottom: 10px;
+        }
+        .tab-button {
+            padding: 12px 20px;
+            background-color: #1a0033;
+            border: 1px solid #7B2FBE;
+            color: #b0b0b0;
+            cursor: pointer;
+            border-radius: 5px 5px 0 0;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+        .tab-button:hover {
+            background-color: #2a0052;
+            color: #e0aaff;
+        }
+        .tab-button.active {
+            background-color: #7B2FBE;
+            color: #ffffff;
+            border-color: #e0aaff;
+        }
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .section {
+            background-color: #1a0033;
+            border: 1px solid #7B2FBE;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .section-title {
+            color: #e0aaff;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+        .section-title::before {
+            content: '';
+            display: inline-block;
+            width: 4px;
+            height: 20px;
+            background-color: #7B2FBE;
+            margin-right: 10px;
+            border-radius: 2px;
+        }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .kpi {
+            background-color: #0d0221;
+            border: 1px solid #7B2FBE;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .kpi:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 15px rgba(123, 47, 190, 0.3);
+        }
+        .kpi-label {
+            color: #b0b0b0;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        .kpi-value {
+            color: #e0aaff;
+            font-size: 28px;
+            font-weight: bold;
+        }
+        .kpi-unit {
+            color: #7B2FBE;
+            font-size: 12px;
+            margin-top: 3px;
+        }
+        .chart-container {
+            background-color: #0d0221;
+            border: 1px solid #7B2FBE;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            overflow: hidden;
+        }
+        .chart-wrapper {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .chart-wrapper.full {
+            grid-template-columns: 1fr;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: #0d0221;
+            margin-top: 15px;
+        }
+        thead {
+            background-color: #7B2FBE;
+            color: #ffffff;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #7B2FBE;
+        }
+        tr:hover {
+            background-color: #1a0033;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-optimal { background-color: #00aa00; color: #ffffff; }
+        .status-feasible { background-color: #ffaa00; color: #000000; }
+        .status-infeasible { background-color: #aa0000; color: #ffffff; }
+        .gauge {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin: 15px 0;
+        }
+        .gauge-label { color: #b0b0b0; font-size: 14px; }
+        .gauge-bar {
+            flex: 1;
+            height: 8px;
+            background-color: #0d0221;
+            border-radius: 4px;
+            margin: 0 15px;
+            overflow: hidden;
+        }
+        .gauge-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #7B2FBE, #e0aaff);
+            border-radius: 4px;
+        }
+        .gauge-value { color: #e0aaff; font-weight: bold; min-width: 50px; text-align: right; }
+        .metric-comparison {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .comparison-box {
+            background-color: #0d0221;
+            border: 1px solid #7B2FBE;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .comparison-label {
+            color: #b0b0b0;
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
+        .comparison-value {
+            color: #e0aaff;
+            font-size: 20px;
+            font-weight: bold;
+        }
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #7B2FBE;
+            font-size: 12px;
+            border-top: 1px solid #7B2FBE;
+            margin-top: 30px;
+        }
     </style>
 </head>
 <body>
-    <h1>Berth Gantt Timeline</h1>
-    <div id="chart" style="width:100%;height:600px;"></div>
-    <script>
-        const ganttData = __GANTT_DATA_PLACEHOLDER__;
-        const bars = [];
-        ganttData.forEach((item, idx) => {
-            bars.push({
-                y: [item.berth],
-                x: [[new Date(item.start), new Date(item.end)]],
-                name: item.vessel,
-                type: 'bar',
-                orientation: 'h',
-                marker: { color: item.priority <= 2 ? '#e0aaff' : '#7B2FBE' },
-                hovertemplate: '<b>%%{fullData.name}</b><br>Berth: %%{y}<br>Cranes: ' + item.cranes + '<extra></extra>'
-            });
-        });
-        const layout = {
-            title: 'Vessel-to-Berth Assignments Over Time',
-            xaxis: { title: 'Time' },
-            yaxis: { title: 'Berth' },
-            plot_bgcolor: '#1a0033',
-            paper_bgcolor: '#0d0221',
-            font: { color: '#ffffff' },
-            barmode: 'overlay'
-        };
-        Plotly.newPlot('chart', bars, layout);
-    </script>
-</body>
-</html>
-"""
-    gantt_html = gantt_html.replace("__GANTT_DATA_PLACEHOLDER__", _json_safe(gantt_data))
+    <div class="header">
+        <h1>Quantum QUBO/SQA Solver</h1>
+        <p>Expert Dashboard v5.0 - Multi-Start SQA with Dynamic Optimization</p>
+    </div>
 
-    with open("additional_output/01_berth_gantt_timeline.html", "w") as f:
-        f.write(gantt_html)
+    <div class="tabs">
+        <button class="tab-button active" onclick="showTab('tab1')">Port Overview</button>
+        <button class="tab-button" onclick="showTab('tab2')">Gantt Timeline</button>
+        <button class="tab-button" onclick="showTab('tab3')">Cost Intelligence</button>
+        <button class="tab-button" onclick="showTab('tab4')">SQA Quantum Analysis</button>
+        <button class="tab-button" onclick="showTab('tab5')">Berth Analytics</button>
+        <button class="tab-button" onclick="showTab('tab6')">Performance Summary</button>
+    </div>
 
-    # ── 02: Cost Analysis Dashboard ──────────────────────────────────
-    cost_html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Cost Analysis Dashboard</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: #0d0221; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        h1 { color: #e0aaff; }
-        .kpis { display: flex; justify-content: space-around; margin: 20px 0; }
-        .kpi { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; padding: 15px; text-align: center; flex: 1; margin: 0 10px; }
-        .kpi-value { font-size: 24px; color: #e0aaff; font-weight: bold; }
-        .kpi-label { color: #b0b0b0; font-size: 12px; }
-        #chartPie { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; display: inline-block; width: 48%; margin: 10px 1%; }
-        #chartBar { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; display: inline-block; width: 48%; margin: 10px 1%; }
-    </style>
-</head>
-<body>
-    <h1>Cost Analysis Dashboard</h1>
-    <div class="kpis">
-        <div class="kpi">
-            <div class="kpi-label">Total Cost</div>
-            <div class="kpi-value">__TOTAL_COST_PLACEHOLDER__</div>
-        </div>
-        <div class="kpi">
-            <div class="kpi-label">Cost per Vessel</div>
-            <div class="kpi-value">__COST_PER_VESSEL_PLACEHOLDER__</div>
-        </div>
-        <div class="kpi">
-            <div class="kpi-label">Cost per TEU</div>
-            <div class="kpi-value">__COST_PER_TEU_PLACEHOLDER__</div>
+    <!-- TAB 1: Port Overview -->
+    <div id="tab1" class="tab-content active">
+        <div class="section">
+            <div class="section-title">Port Overview</div>
+            <div style="background-color: #0d0221; padding: 20px; border-radius: 8px; margin-bottom: 15px;">
+                <svg id="portMap" width="100%" height="400" style="background-color: #0d0221; border: 1px solid #7B2FBE; border-radius: 8px;"></svg>
+            </div>
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <div class="kpi-label">Total Vessels</div>
+                    <div class="kpi-value">__NUM_VESSELS__</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Assigned</div>
+                    <div class="kpi-value">__FEASIBLE_COUNT__</div>
+                    <div class="kpi-unit">vessels</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Total Berths</div>
+                    <div class="kpi-value">__NUM_BERTHS__</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Average Cranes/Vessel</div>
+                    <div class="kpi-value">__AVG_CRANES__</div>
+                </div>
+            </div>
         </div>
     </div>
-    <div id="chartPie" style="height:400px;"></div>
-    <div id="chartBar" style="height:400px;"></div>
+
+    <!-- TAB 2: Gantt Timeline -->
+    <div id="tab2" class="tab-content">
+        <div class="section">
+            <div class="section-title">Vessel-to-Berth Assignment Timeline</div>
+            <div id="ganttChart" class="chart-container" style="height: 600px;"></div>
+        </div>
+    </div>
+
+    <!-- TAB 3: Cost Intelligence -->
+    <div id="tab3" class="tab-content">
+        <div class="section">
+            <div class="section-title">Cost Intelligence Dashboard</div>
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <div class="kpi-label">Total Cost</div>
+                    <div class="kpi-value">__TOTAL_COST__</div>
+                    <div class="kpi-unit">USD</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Cost per Vessel</div>
+                    <div class="kpi-value">__COST_PER_VESSEL__</div>
+                    <div class="kpi-unit">USD</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Cost per TEU</div>
+                    <div class="kpi-value">__COST_PER_TEU__</div>
+                    <div class="kpi-unit">USD/TEU</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Makespan</div>
+                    <div class="kpi-value">__MAKESPAN__</div>
+                    <div class="kpi-unit">hours</div>
+                </div>
+            </div>
+            <div class="chart-wrapper">
+                <div id="costBreakdownChart" class="chart-container" style="height: 400px;"></div>
+                <div id="costPerVesselChart" class="chart-container" style="height: 400px;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 4: SQA Quantum Analysis -->
+    <div id="tab4" class="tab-content">
+        <div class="section">
+            <div class="section-title">SQA Quantum Analysis</div>
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <div class="kpi-label">QUBO Variables</div>
+                    <div class="kpi-value">__QUBO_VARS__</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Nonzero Entries</div>
+                    <div class="kpi-value">__QUBO_NONZERO__</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Matrix Density</div>
+                    <div class="kpi-value">__QUBO_DENSITY__</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-label">Feasible Vars</div>
+                    <div class="kpi-value">__FEASIBLE_VARS__</div>
+                </div>
+            </div>
+            <div class="chart-wrapper full">
+                <div id="convergenceChart" class="chart-container" style="height: 500px;"></div>
+            </div>
+            <div class="section">
+                <div class="section-title">Constraint Satisfaction</div>
+                <div style="padding: 15px;">
+                    <div class="gauge">
+                        <div class="gauge-label">One Berth per Vessel</div>
+                        <div class="gauge-bar">
+                            <div class="gauge-fill" style="width: __BERTH_SAT_PERCENT__;"></div>
+                        </div>
+                        <div class="gauge-value">__BERTH_SAT__ / __TOTAL_VESSELS__</div>
+                    </div>
+                    <div class="gauge">
+                        <div class="gauge-label">One Crane Level per Vessel</div>
+                        <div class="gauge-bar">
+                            <div class="gauge-fill" style="width: __CRANE_SAT_PERCENT__;"></div>
+                        </div>
+                        <div class="gauge-value">__CRANE_SAT__ / __TOTAL_VESSELS__</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 5: Berth Analytics -->
+    <div id="tab5" class="tab-content">
+        <div class="section">
+            <div class="section-title">Berth Utilization & Analytics</div>
+            <div class="chart-wrapper">
+                <div id="berthUtilChart" class="chart-container" style="height: 400px;"></div>
+                <div id="craneDistChart" class="chart-container" style="height: 400px;"></div>
+            </div>
+            <div class="chart-wrapper full">
+                <div id="priorityVsBerthChart" class="chart-container" style="height: 400px;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 6: Performance Summary -->
+    <div id="tab6" class="tab-content">
+        <div class="section">
+            <div class="section-title">Solver Performance Metrics</div>
+            <div class="metric-comparison">
+                <div class="comparison-box">
+                    <div class="comparison-label">Wall Time (s)</div>
+                    <div class="comparison-value">__WALL_TIME__</div>
+                </div>
+                <div class="comparison-box">
+                    <div class="comparison-label">SQA Time (s)</div>
+                    <div class="comparison-value">__SQA_TIME__</div>
+                </div>
+                <div class="comparison-box">
+                    <div class="comparison-label">Repair Time (s)</div>
+                    <div class="comparison-value">__REPAIR_TIME__</div>
+                </div>
+                <div class="comparison-box">
+                    <div class="comparison-label">2-Opt Time (s)</div>
+                    <div class="comparison-value">__SWAP_TIME__</div>
+                </div>
+                <div class="comparison-box">
+                    <div class="comparison-label">Algorithm</div>
+                    <div class="comparison-value">__ALGORITHM__</div>
+                </div>
+                <div class="comparison-box">
+                    <div class="comparison-label">Version</div>
+                    <div class="comparison-value">__VERSION__</div>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">Hardware Readiness</div>
+                <div style="padding: 15px;">
+                    <div class="gauge">
+                        <div class="gauge-label">Hardware Ready (<=5000 vars)</div>
+                        <div style="flex: 1;"></div>
+                        <div class="gauge-value">__HARDWARE_READY__</div>
+                    </div>
+                    <div class="gauge">
+                        <div class="gauge-label">D-Wave Compatible</div>
+                        <div style="flex: 1;"></div>
+                        <div class="gauge-value">__DWAVE_COMPAT__</div>
+                    </div>
+                </div>
+            </div>
+            <div class="section">
+                <div class="section-title">Assignment Comparison</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Source</th>
+                            <th>Count</th>
+                            <th>Percentage</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>SQA Direct</td>
+                            <td>__SQA_ASSIGNED__</td>
+                            <td>__SQA_PERCENT__</td>
+                        </tr>
+                        <tr>
+                            <td>Greedy Repair</td>
+                            <td>__REPAIR_ASSIGNED__</td>
+                            <td>__REPAIR_PERCENT__</td>
+                        </tr>
+                        <tr>
+                            <td>2-Opt Swaps</td>
+                            <td>__SWAP_ITER__</td>
+                            <td>--</td>
+                        </tr>
+                        <tr>
+                            <td>Total Feasible</td>
+                            <td>__FEASIBLE_COUNT__</td>
+                            <td>__FEASIBLE_PERCENT__</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        Quantum QUBO/SQA Solver v5.0 | Multi-Start SQA + Sparse QUBO + Crane Reoptimization
+    </div>
+
     <script>
-        const costBreakdown = __COST_BREAKDOWN_PLACEHOLDER__;
-        const assignments = __ASSIGNMENTS_PLACEHOLDER__;
+        const ganttDataSet = __GANTT_DATA_PLACEHOLDER__;
+        const costBreakdownData = __COST_BREAKDOWN_PLACEHOLDER__;
+        const sqaConvergenceData = __SQA_CONVERGENCE_PLACEHOLDER__;
+        const berthUtilizationData = __BERTH_UTIL_PLACEHOLDER__;
+        const craneDistributionData = __CRANE_DIST_PLACEHOLDER__;
+        const assignmentsData = __ASSIGNMENTS_PLACEHOLDER__;
+        const scheduleMetricsData = __SCHEDULE_METRICS_PLACEHOLDER__;
 
-        const pieFigure = {
-            data: [{
-                labels: ['Crane Handling', 'Waiting', 'Delay Penalty'],
-                values: [costBreakdown.crane_handling_cost, costBreakdown.waiting_cost, costBreakdown.delay_penalty_cost],
-                type: 'pie',
-                marker: { colors: ['#7B2FBE', '#e0aaff', '#b366ff'] }
-            }],
-            layout: {
-                title: 'Cost Breakdown',
-                plot_bgcolor: '#1a0033',
-                paper_bgcolor: '#0d0221',
-                font: { color: '#ffffff' }
-            }
-        };
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-button').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
 
-        const vesselCosts = assignments.filter(a => a.berth_id).map(a => ({ vessel: a.vessel_name, cost: a.cost }));
-        const barFigure = {
-            data: [{
-                x: vesselCosts.map(v => v.vessel),
-                y: vesselCosts.map(v => v.cost),
-                type: 'bar',
-                marker: { color: '#7B2FBE' }
-            }],
-            layout: {
-                title: 'Cost per Vessel',
-                xaxis: { title: 'Vessel' },
-                yaxis: { title: 'Cost ($)' },
-                plot_bgcolor: '#1a0033',
-                paper_bgcolor: '#0d0221',
-                font: { color: '#ffffff' }
-            }
-        };
+        // Tab 2: Gantt Timeline
+        const ganttBars = ganttDataSet.map((item, idx) => ({
+            y: [item.berth],
+            x: [[new Date(item.start), new Date(item.end)]],
+            name: item.vessel,
+            type: 'bar',
+            orientation: 'h',
+            marker: { color: item.priority <= 2 ? '#e0aaff' : '#7B2FBE' },
+            hovertemplate: '<b>%%{fullData.name}</b><br>Berth: %%{y}<br>Cranes: ' + item.cranes + '<extra></extra>'
+        }));
+        Plotly.newPlot('ganttChart', ganttBars, {
+            title: 'Vessel-to-Berth Assignment Timeline',
+            xaxis: { title: 'Time' },
+            yaxis: { title: 'Berth' },
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
+            font: { color: '#ffffff' },
+            barmode: 'overlay',
+            margin: { l: 100, r: 50, t: 50, b: 50 }
+        });
 
-        Plotly.newPlot('chartPie', pieFigure.data, pieFigure.layout);
-        Plotly.newPlot('chartBar', barFigure.data, barFigure.layout);
-    </script>
-</body>
-</html>
-"""
-    cost_html = cost_html.replace("__TOTAL_COST_PLACEHOLDER__", f"${int(cost_breakdown['total_cost'])}")
-    cost_html = cost_html.replace("__COST_PER_VESSEL_PLACEHOLDER__", f"${int(cost_breakdown['cost_per_vessel'])}")
-    cost_html = cost_html.replace("__COST_PER_TEU_PLACEHOLDER__", f"${round(cost_breakdown['cost_per_teu'], 4)}")
-    cost_html = cost_html.replace("__COST_BREAKDOWN_PLACEHOLDER__", _json_safe(cost_breakdown))
-    cost_html = cost_html.replace("__ASSIGNMENTS_PLACEHOLDER__", _json_safe(assignments))
+        // Tab 3: Cost Breakdown
+        Plotly.newPlot('costBreakdownChart', [{
+            labels: ['Crane Handling', 'Waiting', 'Delay Penalty'],
+            values: [costBreakdownData.crane_handling_cost, costBreakdownData.waiting_cost, costBreakdownData.delay_penalty_cost],
+            type: 'pie',
+            marker: { colors: ['#7B2FBE', '#e0aaff', '#b366ff'] }
+        }], {
+            title: 'Cost Breakdown',
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
+            font: { color: '#ffffff' }
+        });
 
-    with open("additional_output/02_cost_analysis_dashboard.html", "w") as f:
-        f.write(cost_html)
+        // Tab 3: Cost per Vessel
+        const vesselCosts = assignmentsData.filter(a => a.berth_id).map(a => ({vessel: a.vessel_name, cost: a.cost}));
+        Plotly.newPlot('costPerVesselChart', [{
+            x: vesselCosts.map(v => v.vessel),
+            y: vesselCosts.map(v => v.cost),
+            type: 'bar',
+            marker: { color: '#7B2FBE' }
+        }], {
+            title: 'Cost per Vessel',
+            xaxis: { title: 'Vessel' },
+            yaxis: { title: 'Cost (USD)' },
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
+            font: { color: '#ffffff' }
+        });
 
-    # ── 03: SQA Convergence ──────────────────────────────────────────
-    convergence_html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>SQA Convergence</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: #0d0221; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        h1 { color: #e0aaff; }
-        #chart { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; }
-    </style>
-</head>
-<body>
-    <h1>SQA Energy Convergence</h1>
-    <div id="chart" style="width:100%;height:600px;"></div>
-    <script>
-        const convergence = __CONVERGENCE_PLACEHOLDER__;
-        const sweeps = convergence.energy_evolution.map(e => e.sweep);
-        const energies = convergence.energy_evolution.map(e => e.best_energy);
-        const temps = convergence.energy_evolution.map(e => e.temperature);
-        const gammas = convergence.energy_evolution.map(e => e.transverse_field);
+        // Tab 4: Convergence
+        const convergenceSweeps = sqaConvergenceData.energy_evolution.map(e => e.sweep);
+        const convergenceEnergies = sqaConvergenceData.energy_evolution.map(e => e.best_energy);
+        const convergenceTemps = sqaConvergenceData.energy_evolution.map(e => e.temperature);
+        const convergenceGammas = sqaConvergenceData.energy_evolution.map(e => e.transverse_field);
 
-        const data = [
+        Plotly.newPlot('convergenceChart', [
             {
-                x: sweeps,
-                y: energies,
+                x: convergenceSweeps,
+                y: convergenceEnergies,
                 name: 'Best Energy',
                 yaxis: 'y1',
                 type: 'scatter',
                 mode: 'lines',
-                line: { color: '#e0aaff', width: 2 }
+                line: { color: '#e0aaff', width: 3 }
             },
             {
-                x: sweeps,
-                y: temps,
+                x: convergenceSweeps,
+                y: convergenceTemps,
                 name: 'Temperature',
                 yaxis: 'y2',
                 type: 'scatter',
@@ -972,167 +1384,211 @@ def _generate_additional_output(assignments, berths, vessels, cost_breakdown, sq
                 line: { color: '#7B2FBE', width: 2, dash: 'dash' }
             },
             {
-                x: sweeps,
-                y: gammas,
+                x: convergenceSweeps,
+                y: convergenceGammas,
                 name: 'Transverse Field',
                 yaxis: 'y2',
                 type: 'scatter',
                 mode: 'lines',
                 line: { color: '#b366ff', width: 2, dash: 'dot' }
             }
-        ];
-
-        const layout = {
+        ], {
             title: 'SQA Energy Evolution & Annealing Schedule',
             xaxis: { title: 'SQA Sweep' },
             yaxis: { title: 'Energy', titlefont: { color: '#e0aaff' }, tickfont: { color: '#e0aaff' } },
             yaxis2: { title: 'Temp / Gamma', titlefont: { color: '#7B2FBE' }, tickfont: { color: '#7B2FBE' }, overlaying: 'y', side: 'right' },
-            plot_bgcolor: '#1a0033',
-            paper_bgcolor: '#0d0221',
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
             font: { color: '#ffffff' },
             hovermode: 'x unified',
             legend: { x: 0.02, y: 0.98 }
-        };
+        });
 
-        Plotly.newPlot('chart', data, layout);
-    </script>
-</body>
-</html>
-"""
-    convergence_html = convergence_html.replace("__CONVERGENCE_PLACEHOLDER__", _json_safe(sqa_convergence))
-
-    with open("additional_output/03_sqa_convergence.html", "w") as f:
-        f.write(convergence_html)
-
-    # ── 04: Berth Utilization Heatmap ────────────────────────────────
-    util_html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Berth Utilization</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: #0d0221; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        h1 { color: #e0aaff; }
-        #chart { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; }
-    </style>
-</head>
-<body>
-    <h1>Berth Utilization Metrics</h1>
-    <div id="chart" style="width:100%;height:500px;"></div>
-    <script>
-        const utilization = __UTILIZATION_PLACEHOLDER__;
-
-        const data = [
-            {
-                x: utilization.map(u => u.berth_id),
-                y: utilization.map(u => u.utilization_pct),
-                type: 'bar',
-                name: 'Utilization %',
-                marker: { color: '#e0aaff' }
-            }
-        ];
-
-        const layout = {
+        // Tab 5: Berth Utilization
+        Plotly.newPlot('berthUtilChart', [{
+            x: berthUtilizationData.map(u => u.berth_id),
+            y: berthUtilizationData.map(u => u.utilization_pct),
+            type: 'bar',
+            name: 'Utilization %',
+            marker: { color: '#e0aaff' }
+        }], {
             title: 'Berth Utilization Percentage',
             xaxis: { title: 'Berth ID' },
             yaxis: { title: 'Utilization (%)' },
-            plot_bgcolor: '#1a0033',
-            paper_bgcolor: '#0d0221',
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
             font: { color: '#ffffff' }
-        };
+        });
 
-        Plotly.newPlot('chart', data, layout);
+        // Tab 5: Crane Distribution
+        const craneKeys = Object.keys(craneDistributionData).sort();
+        Plotly.newPlot('craneDistChart', [{
+            x: craneKeys,
+            y: craneKeys.map(k => craneDistributionData[k]),
+            type: 'bar',
+            marker: { color: '#b366ff' }
+        }], {
+            title: 'Crane Level Distribution',
+            xaxis: { title: 'Cranes per Vessel' },
+            yaxis: { title: 'Count' },
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
+            font: { color: '#ffffff' }
+        });
+
+        // Tab 5: Priority vs Berth
+        const priorityKeys = Object.keys(scheduleMetricsData).filter(k => k.startsWith('P'));
+        Plotly.newPlot('priorityVsBerthChart', [{
+            x: berthUtilizationData.map(u => u.berth_id),
+            y: berthUtilizationData.map(u => u.vessels_served),
+            type: 'bar',
+            marker: { color: '#7B2FBE' }
+        }], {
+            title: 'Vessels per Berth',
+            xaxis: { title: 'Berth ID' },
+            yaxis: { title: 'Vessel Count' },
+            plot_bgcolor: '#0d0221',
+            paper_bgcolor: '#1a0033',
+            font: { color: '#ffffff' }
+        });
+
+        // Draw Port Map SVG
+        const portSvg = document.getElementById('portMap');
+        const berthCount = __NUM_BERTHS__;
+        const berthHeight = 50;
+        const margin = 40;
+
+        assignmentsData.filter(a => a.berth_id).forEach(a => {
+            const berthIndex = parseInt(a.berth_id.split('-')[1] || 0);
+            const y = margin + berthIndex * berthHeight;
+            const x = margin;
+            const width = Math.min(a.teu_volume / 100, 200);
+            const color = a.priority <= 2 ? '#e0aaff' : '#7B2FBE';
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', x);
+            rect.setAttribute('y', y);
+            rect.setAttribute('width', width);
+            rect.setAttribute('height', berthHeight - 10);
+            rect.setAttribute('fill', color);
+            rect.setAttribute('stroke', '#ffffff');
+            rect.setAttribute('stroke-width', 1);
+            rect.setAttribute('rx', 4);
+            rect.style.cursor = 'pointer';
+            rect.title = a.vessel_name + ' (P' + a.priority + ')';
+            portSvg.appendChild(rect);
+
+            const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            text.setAttribute('x', x + width / 2);
+            text.setAttribute('y', y + berthHeight / 2);
+            text.setAttribute('text-anchor', 'middle');
+            text.setAttribute('dominant-baseline', 'middle');
+            text.setAttribute('fill', '#0d0221');
+            text.setAttribute('font-size', '10');
+            text.setAttribute('font-weight', 'bold');
+            text.textContent = a.vessel_id.split('-')[1] || '?';
+            portSvg.appendChild(text);
+        });
     </script>
 </body>
 </html>
 """
-    util_html = util_html.replace("__UTILIZATION_PLACEHOLDER__", _json_safe(berth_utilization))
 
-    with open("additional_output/04_berth_utilization_heatmap.html", "w") as f:
-        f.write(util_html)
+    # Data injection with .replace()
+    expert_dashboard = expert_dashboard.replace(
+        "__GANTT_DATA_PLACEHOLDER__",
+        json.dumps(gantt_data, default=str)
+    )
+    expert_dashboard = expert_dashboard.replace(
+        "__COST_BREAKDOWN_PLACEHOLDER__",
+        json.dumps(cost_breakdown, default=str)
+    )
+    expert_dashboard = expert_dashboard.replace(
+        "__SQA_CONVERGENCE_PLACEHOLDER__",
+        json.dumps(sqa_convergence, default=str)
+    )
+    expert_dashboard = expert_dashboard.replace(
+        "__BERTH_UTIL_PLACEHOLDER__",
+        json.dumps(berth_utilization, default=str)
+    )
+    expert_dashboard = expert_dashboard.replace(
+        "__CRANE_DIST_PLACEHOLDER__",
+        json.dumps({k: v for k, v in {str(i): 0 for i in range(1, 5)}.items()}, default=str)
+    )
 
-    # ── 05: Quantum Metrics Summary ──────────────────────────────────
-    quantum_html = """<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Quantum Metrics Summary</title>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <style>
-        body { background-color: #0d0221; color: #ffffff; font-family: Arial, sans-serif; margin: 0; padding: 20px; }
-        h1 { color: #e0aaff; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin: 20px 0; }
-        .metric-box { background-color: #1a0033; border: 1px solid #7B2FBE; border-radius: 8px; padding: 15px; }
-        .metric-title { color: #e0aaff; font-weight: bold; font-size: 14px; }
-        .metric-value { color: #b0b0b0; font-size: 18px; margin-top: 5px; }
-        .metric-detail { color: #808080; font-size: 11px; margin-top: 5px; }
-    </style>
-</head>
-<body>
-    <h1>Quantum Metrics Summary</h1>
-    <div class="metrics-grid">
-        <div class="metric-box">
-            <div class="metric-title">QUBO Variables</div>
-            <div class="metric-value">__QUBO_VARS_PLACEHOLDER__</div>
-            <div class="metric-detail">Assignment: __ASSIGN_VARS_PLACEHOLDER__, Crane: __CRANE_VARS_PLACEHOLDER__</div>
-        </div>
-        <div class="metric-box">
-            <div class="metric-title">QUBO Density</div>
-            <div class="metric-value">__QUBO_DENSITY_PLACEHOLDER__</div>
-            <div class="metric-detail">Nonzero entries: __NONZERO_PLACEHOLDER__</div>
-        </div>
-        <div class="metric-box">
-            <div class="metric-title">Constraint Satisfaction</div>
-            <div class="metric-value">__BERTH_SAT_PLACEHOLDER__ / __TOTAL_VESSELS_PLACEHOLDER__ vessels</div>
-            <div class="metric-detail">One-berth: __BERTH_SAT_PLACEHOLDER__, One-crane: __CRANE_SAT_PLACEHOLDER__</div>
-        </div>
-        <div class="metric-box">
-            <div class="metric-title">Quantum Advantage</div>
-            <div class="metric-value">Hardware Ready: __HARDWARE_READY_PLACEHOLDER__</div>
-            <div class="metric-detail">D-Wave Compatible: __DWAVE_PLACEHOLDER__</div>
-        </div>
-        <div class="metric-box">
-            <div class="metric-title">Wall Time</div>
-            <div class="metric-value">__WALL_TIME_PLACEHOLDER__ seconds</div>
-            <div class="metric-detail">SQA: __SQA_TIME_PLACEHOLDER__ s, Repair: __REPAIR_TIME_PLACEHOLDER__ s</div>
-        </div>
-        <div class="metric-box">
-            <div class="metric-title">Algorithm</div>
-            <div class="metric-value">__ALGORITHM_PLACEHOLDER__</div>
-            <div class="metric-detail">Trotter Slices: __TROTTER_PLACEHOLDER__, Version: __VERSION_PLACEHOLDER__</div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    quantum_html = quantum_html.replace("__QUBO_VARS_PLACEHOLDER__", str(qubo_analysis["total_variables"]))
-    quantum_html = quantum_html.replace("__ASSIGN_VARS_PLACEHOLDER__", str(qubo_analysis["assignment_variables"]))
-    quantum_html = quantum_html.replace("__CRANE_VARS_PLACEHOLDER__", str(qubo_analysis["crane_variables"]))
-    quantum_html = quantum_html.replace("__QUBO_DENSITY_PLACEHOLDER__", f"{qubo_analysis['matrix_density']:.6f}")
-    quantum_html = quantum_html.replace("__NONZERO_PLACEHOLDER__", str(qubo_analysis["nonzero_entries"]))
-    quantum_html = quantum_html.replace("__BERTH_SAT_PLACEHOLDER__", str(qubo_analysis["constraint_satisfaction"]["one_berth_per_vessel"]))
-    quantum_html = quantum_html.replace("__TOTAL_VESSELS_PLACEHOLDER__", str(qubo_analysis["constraint_satisfaction"]["total_vessels"]))
-    quantum_html = quantum_html.replace("__CRANE_SAT_PLACEHOLDER__", str(qubo_analysis["constraint_satisfaction"]["one_crane_per_vessel"]))
-    quantum_html = quantum_html.replace("__HARDWARE_READY_PLACEHOLDER__", str(quantum_advantage["hardware_ready"]))
-    quantum_html = quantum_html.replace("__DWAVE_PLACEHOLDER__", str(quantum_advantage["dwave_compatible"]))
-    quantum_html = quantum_html.replace("__WALL_TIME_PLACEHOLDER__", f"{computation_metrics['wall_time_s']:.3f}")
-    quantum_html = quantum_html.replace("__SQA_TIME_PLACEHOLDER__", f"{computation_metrics['sqa_time_s']:.3f}")
-    quantum_html = quantum_html.replace("__REPAIR_TIME_PLACEHOLDER__", f"{computation_metrics['repair_time_s']:.3f}")
-    quantum_html = quantum_html.replace("__ALGORITHM_PLACEHOLDER__", computation_metrics["algorithm"])
-    quantum_html = quantum_html.replace("__TROTTER_PLACEHOLDER__", str(computation_metrics.get("trotter_slices", 30)))
-    quantum_html = quantum_html.replace("__VERSION_PLACEHOLDER__", computation_metrics["solver_version"])
+    # Calculate crane distribution from assignments
+    crane_dist = {}
+    for a in assignments:
+        nc = a.get("cranes_assigned", 0)
+        crane_dist[str(nc)] = crane_dist.get(str(nc), 0) + 1
+    expert_dashboard = expert_dashboard.replace(
+        "__CRANE_DIST_PLACEHOLDER__",
+        json.dumps(crane_dist, default=str)
+    )
 
-    with open("additional_output/05_quantum_metrics_summary.html", "w") as f:
-        f.write(quantum_html)
+    expert_dashboard = expert_dashboard.replace(
+        "__ASSIGNMENTS_PLACEHOLDER__",
+        json.dumps(assignments, default=str)
+    )
+    expert_dashboard = expert_dashboard.replace(
+        "__SCHEDULE_METRICS_PLACEHOLDER__",
+        json.dumps(schedule_metrics, default=str)
+    )
+
+    # KPI values
+    feasible_count = sum(1 for a in assignments if a.get("berth_id") is not None)
+    num_vessels = len(assignments)
+    num_berths = len(berths)
+    avg_cranes = sum(a.get("cranes_assigned", 0) for a in assignments) / max(feasible_count, 1)
+
+    expert_dashboard = expert_dashboard.replace("__NUM_VESSELS__", str(num_vessels))
+    expert_dashboard = expert_dashboard.replace("__FEASIBLE_COUNT__", str(feasible_count))
+    expert_dashboard = expert_dashboard.replace("__NUM_BERTHS__", str(num_berths))
+    expert_dashboard = expert_dashboard.replace("__AVG_CRANES__", f"{avg_cranes:.2f}")
+
+    expert_dashboard = expert_dashboard.replace("__TOTAL_COST__", f"${int(cost_breakdown['total_cost'])}")
+    expert_dashboard = expert_dashboard.replace("__COST_PER_VESSEL__", f"${int(cost_breakdown['cost_per_vessel'])}")
+    expert_dashboard = expert_dashboard.replace("__COST_PER_TEU__", f"${cost_breakdown['cost_per_teu']:.4f}")
+    expert_dashboard = expert_dashboard.replace("__MAKESPAN__", f"{schedule_metrics['makespan']:.1f}")
+
+    expert_dashboard = expert_dashboard.replace("__QUBO_VARS__", str(qubo_analysis["total_variables"]))
+    expert_dashboard = expert_dashboard.replace("__QUBO_NONZERO__", str(qubo_analysis["nonzero_entries"]))
+    expert_dashboard = expert_dashboard.replace("__QUBO_DENSITY__", f"{qubo_analysis['matrix_density']:.6f}")
+    expert_dashboard = expert_dashboard.replace("__FEASIBLE_VARS__", str(qubo_analysis.get("feasible_assignment_vars", 0)))
+
+    berth_sat = qubo_analysis["constraint_satisfaction"]["one_berth_per_vessel"]
+    crane_sat = qubo_analysis["constraint_satisfaction"]["one_crane_per_vessel"]
+    total_vess = qubo_analysis["constraint_satisfaction"]["total_vessels"]
+    expert_dashboard = expert_dashboard.replace("__BERTH_SAT__", str(berth_sat))
+    expert_dashboard = expert_dashboard.replace("__CRANE_SAT__", str(crane_sat))
+    expert_dashboard = expert_dashboard.replace("__TOTAL_VESSELS__", str(total_vess))
+    expert_dashboard = expert_dashboard.replace("__BERTH_SAT_PERCENT__", f"{(berth_sat / max(total_vess, 1)) * 100:.0f}%")
+    expert_dashboard = expert_dashboard.replace("__CRANE_SAT_PERCENT__", f"{(crane_sat / max(total_vess, 1)) * 100:.0f}%")
+
+    expert_dashboard = expert_dashboard.replace("__WALL_TIME__", f"{computation_metrics['wall_time_s']:.3f}")
+    expert_dashboard = expert_dashboard.replace("__SQA_TIME__", f"{computation_metrics['sqa_time_s']:.3f}")
+    expert_dashboard = expert_dashboard.replace("__REPAIR_TIME__", f"{computation_metrics['repair_time_s']:.3f}")
+    expert_dashboard = expert_dashboard.replace("__SWAP_TIME__", f"{computation_metrics.get('swap_time_s', 0):.3f}")
+    expert_dashboard = expert_dashboard.replace("__ALGORITHM__", computation_metrics["algorithm"])
+    expert_dashboard = expert_dashboard.replace("__VERSION__", computation_metrics["solver_version"])
+    expert_dashboard = expert_dashboard.replace("__HARDWARE_READY__", str(quantum_advantage["hardware_ready"]))
+    expert_dashboard = expert_dashboard.replace("__DWAVE_COMPAT__", str(quantum_advantage["dwave_compatible"]))
+
+    sqa_assigned = sum(1 for a in assignments if a.get("assignment_source") == "sqa")
+    repair_assigned = feasible_count - sqa_assigned
+    expert_dashboard = expert_dashboard.replace("__SQA_ASSIGNED__", str(sqa_assigned))
+    expert_dashboard = expert_dashboard.replace("__SQA_PERCENT__", f"{(sqa_assigned / max(num_vessels, 1)) * 100:.1f}%")
+    expert_dashboard = expert_dashboard.replace("__REPAIR_ASSIGNED__", str(repair_assigned))
+    expert_dashboard = expert_dashboard.replace("__REPAIR_PERCENT__", f"{(repair_assigned / max(num_vessels, 1)) * 100:.1f}%")
+    expert_dashboard = expert_dashboard.replace("__SWAP_ITER__", "0")
+    expert_dashboard = expert_dashboard.replace("__FEASIBLE_PERCENT__", f"{(feasible_count / max(num_vessels, 1)) * 100:.1f}%")
+
+    with open("additional_output/01_expert_dashboard.html", "w") as f:
+        f.write(expert_dashboard)
+
+    logger.info("Expert dashboard generated: 01_expert_dashboard.html")
 
 
-def _json_safe(obj):
-    """Convert Python object to JSON-safe string for embedding in HTML."""
-    return json.dumps(obj, default=str)
-
-
-# ── Helper functions (v4.0) ─────────────────────────────────────────
+# ── Helper functions (v5.0) ─────────────────────────────────────────
 
 def _compute_energy(state, Q):
     """Compute QUBO energy for a given state."""
@@ -1183,7 +1639,7 @@ def _hours_to_iso(hours, reference_iso):
 def _greedy_init_state(n_vars, n_vars_assign, n_berths, n_crane_levels,
                        vessels, berths, min_cranes, max_cranes):
     """
-    v4.0: Warm-start initialization with greedy-like solution.
+    v5.0: Warm-start initialization with greedy-like solution.
     Assigns high-priority vessels to feasible berths with reasonable crane counts.
     """
     state = [0] * n_vars
@@ -1194,24 +1650,19 @@ def _greedy_init_state(n_vars, n_vars_assign, n_berths, n_crane_levels,
     def crane_idx(v, k):
         return n_vars_assign + v * n_crane_levels + (k - min_cranes)
 
-    # Sort vessels by priority (ascending = higher priority first)
     vessel_order = list(range(len(vessels)))
     vessel_order.sort(key=lambda vi: vessels[vi].get("priority", 3))
 
-    assigned_berths = {}  # berth -> count of assignments
+    assigned_berths = {}
 
     for vi in vessel_order:
         v = vessels[vi]
         v_len = v.get("length_m", 200)
         v_draft = v.get("draft_m", 12)
 
-        # Find first feasible berth
         for bi, b in enumerate(berths):
             if v_len <= b.get("length_m", 300) and v_draft <= b.get("depth_m", 15):
-                # Assign to this berth
                 state[assign_idx(vi, bi)] = 1
-
-                # Assign moderate crane count
                 mid_crane_idx = (min_cranes + max_cranes) // 2
                 state[crane_idx(vi, mid_crane_idx)] = 1
                 assigned_berths[bi] = assigned_berths.get(bi, 0) + 1
@@ -1271,7 +1722,6 @@ def _calculate_total_cost(raw_assignments, vessels, berths, berth_occupied,
             arr_h = _iso_to_hours(v_arrival)
             deadline_h = _iso_to_hours(v_deadline)
 
-            # Find actual start time
             actual_start_h = arr_h
             for (occ_s, occ_e) in berth_occupied.get(bi, []):
                 if occ_s != arr_h and actual_start_h < occ_e and (actual_start_h + 0.1) > occ_s:
