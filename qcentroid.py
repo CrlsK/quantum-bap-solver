@@ -581,6 +581,23 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             logger.warning(f"Vessel {v['id']}: no berth assigned even after repair")
 
     feasible_count = sum(1 for a in assignments if a.get("berth_id") is not None)
+
+    # ── 8b. ITERATIVE CRANE BUDGET + RESEQUENCING (v6.0) ────────────
+    for cb_round in range(5):
+        logger.info(f"Crane budget enforcement round {cb_round+1}...")
+        assignments, crane_budget_changes = _enforce_crane_budget(
+            assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights
+        )
+        assignments, reseq_changes = _resequence_all_berths(
+            assignments, vessels, berths, cost_weights, w_priority
+        )
+        round_cost = sum(a["cost"] for a in assignments)
+        logger.info(f"  Round {cb_round+1}: {crane_budget_changes} crane adjustments, "
+                     f"{reseq_changes} resequenced, cost={round_cost:.2f}")
+        if crane_budget_changes == 0:
+            break
+    logger.info(f"Final post-enforcement cost: {round_cost:.2f}")
+
     status = "optimal" if feasible_count == n_vessels else (
         "feasible" if feasible_count > 0 else "infeasible"
     )
@@ -735,7 +752,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "qubo_build_time_s": qubo_build_time,
         "repair_time_s": repair_time,
         "swap_time_s": swap_time,
-        "solver_version": "5.0"
+        "solver_version": "6.0"
     }
 
     quantum_advantage_dict = {
@@ -1588,7 +1605,191 @@ def _generate_additional_output(assignments, berths, vessels, cost_breakdown, sq
     logger.info("Expert dashboard generated: 01_expert_dashboard.html")
 
 
-# ── Helper functions (v5.0) ─────────────────────────────────────────
+# ── v6.0 Helper functions ───────────────────────────────────────────
+
+def _enforce_crane_budget(assignments, vessels, berths, total_cranes, min_cranes, max_cranes, cost_weights):
+    """
+    v6.0: Enforce global crane constraint.
+    At any time t, sum of cranes across ALL simultaneously active vessels <= total_cranes.
+    Priority-weighted: P1 vessels keep cranes, P5 gets reduced first.
+    """
+    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
+    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
+    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
+    w_priority_mult = cost_weights.get("priority_multiplier", 1.5)
+
+    changes = 0
+    if not assignments:
+        return assignments, changes
+
+    active_assignments = []
+    for idx, a in enumerate(assignments):
+        if a.get("berth_id") is None:
+            continue
+        start_h = _iso_to_hours(a["start_time"])
+        end_h = _iso_to_hours(a["end_time"])
+        if end_h <= start_h:
+            end_h = start_h + 1
+        active_assignments.append((start_h, end_h, idx))
+
+    if not active_assignments:
+        return assignments, changes
+
+    events = set()
+    for s, e, _ in active_assignments:
+        events.add(s)
+        events.add(e)
+    events = sorted(events)
+
+    max_allowed = {}
+    for _, _, idx in active_assignments:
+        max_allowed[idx] = assignments[idx]["cranes_assigned"]
+
+    for t_idx in range(len(events) - 1):
+        t = events[t_idx]
+        active_at_t = [(s, e, idx) for s, e, idx in active_assignments if s <= t < e]
+        total_used = sum(assignments[idx]["cranes_assigned"] for _, _, idx in active_at_t)
+
+        if total_used <= total_cranes:
+            continue
+
+        active_sorted = []
+        for s, e, idx in active_at_t:
+            a = assignments[idx]
+            v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+            priority = v_data.get("priority", 5) if v_data else 5
+            teu = a.get("teu_volume", 0)
+            active_sorted.append((priority, -teu, idx))
+        active_sorted.sort()
+
+        budget = total_cranes
+        slot_alloc = {}
+        for _, _, idx in active_sorted:
+            slot_alloc[idx] = min_cranes
+            budget -= min_cranes
+
+        for _, _, idx in active_sorted:
+            if budget <= 0:
+                break
+            wanted = min(assignments[idx]["cranes_assigned"] - min_cranes, budget)
+            if wanted > 0:
+                slot_alloc[idx] += wanted
+                budget -= wanted
+
+        for idx, nc in slot_alloc.items():
+            if nc < max_allowed.get(idx, 999):
+                max_allowed[idx] = nc
+
+    for idx, new_nc in max_allowed.items():
+        a = assignments[idx]
+        if new_nc >= a["cranes_assigned"]:
+            continue
+
+        v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+        b_data = next((b for b in berths if b["id"] == a["berth_id"]), None)
+        if not v_data or not b_data:
+            continue
+
+        v_teu = v_data.get("handling_volume_teu", 1000)
+        v_priority = v_data.get("priority", 3)
+        pm = w_priority_mult if v_priority <= 2 else 1.0
+        b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
+
+        new_handling_h = v_teu / (b_prod * new_nc) if b_prod * new_nc > 0 else 999
+        start_h = _iso_to_hours(a["start_time"])
+        arr_h = _iso_to_hours(v_data.get("arrival_time", a["start_time"]))
+        deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+
+        wait_h = max(0, start_h - arr_h)
+        new_end_h = start_h + new_handling_h
+        new_delay_h = max(0, new_end_h - deadline_h)
+
+        new_cost = (new_handling_h * new_nc * w_handle +
+                    wait_h * w_wait * pm +
+                    new_delay_h * w_delay * pm)
+
+        assignments[idx] = dict(a)
+        assignments[idx]["cranes_assigned"] = new_nc
+        assignments[idx]["handling_hours"] = round(new_handling_h, 2)
+        assignments[idx]["delay_hours"] = round(new_delay_h, 2)
+        assignments[idx]["cost"] = round(new_cost, 2)
+        assignments[idx]["end_time"] = _hours_to_iso(new_end_h, a["start_time"])
+        assignments[idx]["waiting_hours"] = round(wait_h, 2)
+        changes += 1
+
+    return assignments, changes
+
+
+def _resequence_all_berths(assignments, vessels, berths, cost_weights, w_priority_mult):
+    """
+    v6.0: Re-sequence vessels at each berth after crane changes.
+    When handling times change, subsequent vessels shift.
+    """
+    w_handle = cost_weights.get("handling_cost_per_crane_hour", 150)
+    w_wait = cost_weights.get("waiting_cost_per_hour", 500)
+    w_delay = cost_weights.get("delay_penalty_per_hour", 1000)
+
+    changes = 0
+    berth_groups = {}
+    for idx, a in enumerate(assignments):
+        b_id = a.get("berth_id")
+        if b_id is None:
+            continue
+        if b_id not in berth_groups:
+            berth_groups[b_id] = []
+        berth_groups[b_id].append(idx)
+
+    for b_id, indices in berth_groups.items():
+        indices.sort(key=lambda idx: _iso_to_hours(assignments[idx]["start_time"]))
+        berth_free_h = None
+
+        for pos, idx in enumerate(indices):
+            a = assignments[idx]
+            v_data = next((v for v in vessels if v["id"] == a["vessel_id"]), None)
+            b_data = next((b for b in berths if b["id"] == b_id), None)
+            if not v_data or not b_data:
+                continue
+
+            arr_h = _iso_to_hours(v_data.get("arrival_time", a["start_time"]))
+            deadline_h = _iso_to_hours(v_data.get("max_departure_time", "2025-12-31T23:59:00Z"))
+            v_priority = v_data.get("priority", 3)
+            pm = w_priority_mult if v_priority <= 2 else 1.0
+            v_teu = v_data.get("handling_volume_teu", 1000)
+            b_prod = b_data.get("productivity_teu_per_crane_hour", 25)
+            nc = a["cranes_assigned"]
+
+            if berth_free_h is None:
+                new_start_h = arr_h
+            else:
+                new_start_h = max(arr_h, berth_free_h)
+
+            handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+            new_end_h = new_start_h + handling_h
+            wait_h = max(0, new_start_h - arr_h)
+            delay_h = max(0, new_end_h - deadline_h)
+
+            new_cost = (handling_h * nc * w_handle +
+                        wait_h * w_wait * pm +
+                        delay_h * w_delay * pm)
+
+            old_start_h = _iso_to_hours(a["start_time"])
+            if abs(new_start_h - old_start_h) > 0.01 or abs(new_cost - a["cost"]) > 0.01:
+                ref_iso = v_data.get("arrival_time", a["start_time"])
+                assignments[idx] = dict(a)
+                assignments[idx]["start_time"] = _hours_to_iso(new_start_h, ref_iso)
+                assignments[idx]["end_time"] = _hours_to_iso(new_end_h, ref_iso)
+                assignments[idx]["handling_hours"] = round(handling_h, 2)
+                assignments[idx]["waiting_hours"] = round(wait_h, 2)
+                assignments[idx]["delay_hours"] = round(delay_h, 2)
+                assignments[idx]["cost"] = round(new_cost, 2)
+                changes += 1
+
+            berth_free_h = new_end_h
+
+    return assignments, changes
+
+
+# ── Helper functions (v6.0) ─────────────────────────────────────────
 
 def _compute_energy(state, Q):
     """Compute QUBO energy for a given state."""
