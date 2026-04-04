@@ -1,8 +1,15 @@
 """
-Quantum QUBO/SQA BAP+QCA Solver
+Quantum QUBO/SQA BAP+QCA Solver v3.0
 Berth Allocation + Quay Crane Assignment via QUBO formulation
 with Simulated Quantum Annealing (Suzuki-Trotter decomposition).
-Enhanced with rich visual output for benchmarking dashboards.
+
+v3.0 changes:
+- Fixed QUBO cost scaling: removed /(n_vessels*2) divisor that made objectives negligible
+- Adaptive penalty scaling: penalties set relative to estimated max objective cost
+- Post-SQA greedy repair for unassigned vessels (ensures feasibility)
+- Berth time-overlap penalty to prevent two vessels occupying the same berth simultaneously
+- Increased default SQA sweeps to 1000 for better convergence
+- Enhanced rich visual output for benchmarking dashboards
 """
 import logging
 import time
@@ -14,7 +21,7 @@ logger = logging.getLogger("qcentroid-user-log")
 
 def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     start_time = time.time()
-    logger.info("=== Quantum QUBO/SQA BAP+QCA Solver v2.0 ===")
+    logger.info("=== Quantum QUBO/SQA BAP+QCA Solver v3.0 ===")
 
     # ── 1. Parse inputs ──────────────────────────────────────────────
     vessels = input_data.get("vessels", [])
@@ -35,17 +42,44 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     n_berths = len(berths)
     logger.info(f"Problem: {n_vessels} vessels, {n_berths} berths, {total_cranes} cranes")
 
-    # SQA parameters
+    # SQA parameters (v3: increased defaults for better convergence)
     n_trotter = solver_params.get("trotter_slices", 20)
-    n_sweeps = solver_params.get("sqa_sweeps", 500)
-    T_init = solver_params.get("temperature_init", 5.0)
-    T_final = solver_params.get("temperature_final", 0.01)
-    gamma_init = solver_params.get("transverse_field_init", 3.0)
-    gamma_final = solver_params.get("transverse_field_final", 0.01)
+    n_sweeps = solver_params.get("sqa_sweeps", 1000)
+    T_init = solver_params.get("temperature_init", 8.0)
+    T_final = solver_params.get("temperature_final", 0.005)
+    gamma_init = solver_params.get("transverse_field_init", 5.0)
+    gamma_final = solver_params.get("transverse_field_final", 0.005)
     seed = solver_params.get("seed", 42)
     random.seed(seed)
 
-    # ── 2. Build QUBO ────────────────────────────────────────────────
+    # ── 2. Estimate cost scale for adaptive penalty tuning ───────────
+    cost_estimates = []
+    for vi, v in enumerate(vessels):
+        v_teu = v.get("handling_volume_teu", 1000)
+        v_priority = v.get("priority", 3)
+        pm = w_priority if v_priority <= 2 else 1.0
+        for bi, b in enumerate(berths):
+            b_prod = b.get("productivity_teu_per_crane_hour", 25)
+            for nc in range(min_cranes, max_cranes + 1):
+                handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+                cost = handling_h * nc * w_handle * pm
+                cost_estimates.append(cost)
+
+    avg_cost = sum(cost_estimates) / max(len(cost_estimates), 1)
+    max_cost = max(cost_estimates) if cost_estimates else 10000
+    logger.info(f"Cost scale: avg={avg_cost:.0f}, max={max_cost:.0f}")
+
+    # Adaptive penalties: constraint penalties must dominate objective but not by
+    # orders of magnitude, otherwise SQA can't differentiate good from bad assignments
+    penalty_one_berth = max_cost * 2.0    # Must assign exactly one berth
+    penalty_one_crane = max_cost * 2.0    # Must assign exactly one crane level
+    penalty_infeasible = max_cost * 5.0   # Physical infeasibility (vessel doesn't fit)
+    penalty_overlap = max_cost * 1.5      # Time overlap on same berth
+
+    logger.info(f"Adaptive penalties: berth={penalty_one_berth:.0f}, crane={penalty_one_crane:.0f}, "
+                f"infeasible={penalty_infeasible:.0f}, overlap={penalty_overlap:.0f}")
+
+    # ── 3. Build QUBO ────────────────────────────────────────────────
     logger.info("Building QUBO matrix...")
 
     n_vars_assign = n_vessels * n_berths
@@ -65,7 +99,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         return n_vars_assign + v * n_crane_levels + k
 
     # Constraint 1: Each vessel assigned to exactly one berth
-    penalty_one_berth = 1000.0
     for v in range(n_vessels):
         for b1 in range(n_berths):
             i = assign_idx(v, b1)
@@ -75,7 +108,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 Q[(i, j)] = Q.get((i, j), 0) + 2 * penalty_one_berth
 
     # Constraint 2: Each vessel gets exactly one crane level
-    penalty_one_crane = 1000.0
     for v in range(n_vessels):
         for k1 in range(n_crane_levels):
             i = crane_idx(v, k1)
@@ -85,7 +117,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 Q[(i, j)] = Q.get((i, j), 0) + 2 * penalty_one_crane
 
     # Constraint 3: Vessel fits in berth (length + draft)
-    penalty_infeasible = 5000.0
     for vi, v in enumerate(vessels):
         for bi, b in enumerate(berths):
             if v.get("length_m", 200) > b.get("length_m", 300) or \
@@ -93,10 +124,28 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 idx = assign_idx(vi, bi)
                 Q[(idx, idx)] = Q.get((idx, idx), 0) + penalty_infeasible
 
-    # Objective: minimize weighted cost
-    for vi, v in enumerate(vessels):
-        v_teu = v.get("handling_volume_teu", 1000)
-        v_priority = v.get("priority", 3)
+    # Constraint 4: Time overlap — penalize two vessels on same berth if windows overlap
+    for bi in range(n_berths):
+        for vi in range(n_vessels):
+            for vj in range(vi + 1, n_vessels):
+                v1 = vessels[vi]
+                v2 = vessels[vj]
+                # Check if time windows could overlap
+                v1_arr = _iso_to_hours(v1.get("arrival_time", ""))
+                v2_arr = _iso_to_hours(v2.get("arrival_time", ""))
+                v1_dep = _iso_to_hours(v1.get("max_departure_time", ""))
+                v2_dep = _iso_to_hours(v2.get("max_departure_time", ""))
+                # If arrival-departure windows overlap, penalize co-assignment
+                if v1_arr < v2_dep and v2_arr < v1_dep:
+                    i = assign_idx(vi, bi)
+                    j = assign_idx(vj, bi)
+                    pair = (min(i, j), max(i, j))
+                    Q[pair] = Q.get(pair, 0) + penalty_overlap
+
+    # Objective: minimize weighted cost (v3: NO divisor — full cost scale)
+    for vi, v_data in enumerate(vessels):
+        v_teu = v_data.get("handling_volume_teu", 1000)
+        v_priority = v_data.get("priority", 3)
         pm = w_priority if v_priority <= 2 else 1.0
 
         for bi, b in enumerate(berths):
@@ -108,13 +157,14 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
                 cost = handling_h * nc * w_handle * pm
 
+                # v3 FIX: Use full cost, no divisor
                 pair = (min(a_idx, c_idx), max(a_idx, c_idx))
-                Q[pair] = Q.get(pair, 0) + cost / (n_vessels * 2)
+                Q[pair] = Q.get(pair, 0) + cost
 
     qubo_build_time = round(time.time() - start_time, 3)
     logger.info(f"QUBO built in {qubo_build_time}s: {len(Q)} non-zero entries")
 
-    # ── 3. Simulated Quantum Annealing (SQA) ────────────────────────
+    # ── 4. Simulated Quantum Annealing (SQA) ────────────────────────
     sqa_start = time.time()
     logger.info(f"Running SQA: {n_trotter} Trotter slices, {n_sweeps} sweeps")
 
@@ -160,7 +210,6 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 best_energy = energy
                 best_state = state[:]
 
-        # Track evolution every 10 sweeps for visualization
         if sweep % 10 == 0:
             energy_evolution.append({
                 "sweep": sweep,
@@ -180,11 +229,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
     sqa_time = round(time.time() - sqa_start, 3)
     logger.info(f"SQA finished in {sqa_time}s. Best energy: {best_energy:.2f}")
 
-    # ── 4. Decode solution ───────────────────────────────────────────
-    assignments = []
-    total_cost = 0
-    total_teu = 0
-
+    # ── 5. Decode QUBO solution ──────────────────────────────────────
+    raw_assignments = []
     for vi, v in enumerate(vessels):
         assigned_berth = None
         for bi in range(n_berths):
@@ -198,41 +244,159 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 assigned_cranes = nc
                 break
 
+        raw_assignments.append({
+            "vessel_idx": vi,
+            "berth_idx": assigned_berth,
+            "cranes": assigned_cranes
+        })
+
+    sqa_assigned = sum(1 for a in raw_assignments if a["berth_idx"] is not None)
+    logger.info(f"SQA assigned {sqa_assigned}/{n_vessels} vessels directly")
+
+    # ── 6. Post-SQA greedy repair for unassigned vessels ─────────────
+    repair_start = time.time()
+    repaired_count = 0
+    berth_occupied = {}  # berth_idx -> list of (start_h, end_h)
+
+    # First, register SQA-assigned vessels
+    for ra in raw_assignments:
+        if ra["berth_idx"] is not None:
+            vi = ra["vessel_idx"]
+            bi = ra["berth_idx"]
+            v = vessels[vi]
+            b = berths[bi]
+            b_prod = b.get("productivity_teu_per_crane_hour", 25)
+            v_teu = v.get("handling_volume_teu", 1000)
+            nc = ra["cranes"]
+            handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+            arr_h = _iso_to_hours(v.get("arrival_time", ""))
+            end_h = arr_h + handling_h
+            if bi not in berth_occupied:
+                berth_occupied[bi] = []
+            berth_occupied[bi].append((arr_h, end_h))
+
+    # Repair unassigned vessels
+    for ra in raw_assignments:
+        if ra["berth_idx"] is not None:
+            continue
+        vi = ra["vessel_idx"]
+        v = vessels[vi]
+        v_len = v.get("length_m", 200)
+        v_draft = v.get("draft_m", 12.0)
+        v_teu = v.get("handling_volume_teu", 1000)
+        v_arrival_h = _iso_to_hours(v.get("arrival_time", ""))
+        v_deadline_h = _iso_to_hours(v.get("max_departure_time", ""))
+        v_priority = v.get("priority", 3)
+        pm = w_priority if v_priority <= 2 else 1.0
+
+        best_bi = None
+        best_nc = min_cranes
+        best_cost = float("inf")
+
+        for bi, b in enumerate(berths):
+            if v_len > b.get("length_m", 300) or v_draft > b.get("depth_m", 15.0):
+                continue
+            b_prod = b.get("productivity_teu_per_crane_hour", 25)
+
+            # Find earliest start at this berth (after all occupied windows)
+            earliest_start = v_arrival_h
+            for (occ_s, occ_e) in berth_occupied.get(bi, []):
+                if earliest_start < occ_e and (earliest_start + 1) > occ_s:
+                    earliest_start = max(earliest_start, occ_e)
+
+            for nc in range(min_cranes, max_cranes + 1):
+                handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
+                end_h = earliest_start + handling_h
+                wait_h = max(0, earliest_start - v_arrival_h)
+                delay_h = max(0, end_h - v_deadline_h)
+
+                cost = (handling_h * nc * w_handle +
+                        wait_h * w_wait * pm +
+                        delay_h * w_delay * pm)
+
+                if cost < best_cost:
+                    best_cost = cost
+                    best_bi = bi
+                    best_nc = nc
+
+        if best_bi is not None:
+            ra["berth_idx"] = best_bi
+            ra["cranes"] = best_nc
+            repaired_count += 1
+            # Register occupation
+            b = berths[best_bi]
+            b_prod = b.get("productivity_teu_per_crane_hour", 25)
+            handling_h = v_teu / (b_prod * best_nc) if b_prod * best_nc > 0 else 999
+            earliest_start = v_arrival_h
+            for (occ_s, occ_e) in berth_occupied.get(best_bi, []):
+                if earliest_start < occ_e and (earliest_start + 1) > occ_s:
+                    earliest_start = max(earliest_start, occ_e)
+            if best_bi not in berth_occupied:
+                berth_occupied[best_bi] = []
+            berth_occupied[best_bi].append((earliest_start, earliest_start + handling_h))
+
+    repair_time = round(time.time() - repair_start, 3)
+    if repaired_count > 0:
+        logger.info(f"Greedy repair assigned {repaired_count} additional vessels in {repair_time}s")
+
+    # ── 7. Build final assignments with full cost calculation ────────
+    assignments = []
+    total_cost = 0
+    total_teu = 0
+
+    for ra in raw_assignments:
+        vi = ra["vessel_idx"]
+        v = vessels[vi]
         v_name = v.get("name", f"Vessel-{v['id']}")
         v_teu = v.get("handling_volume_teu", 1000)
         total_teu += v_teu
 
-        if assigned_berth is not None:
-            b = berths[assigned_berth]
+        if ra["berth_idx"] is not None:
+            bi = ra["berth_idx"]
+            b = berths[bi]
             b_prod = b.get("productivity_teu_per_crane_hour", 25)
-            handling_h = v_teu / (b_prod * assigned_cranes) if b_prod * assigned_cranes > 0 else 999
+            nc = ra["cranes"]
+            handling_h = v_teu / (b_prod * nc) if b_prod * nc > 0 else 999
 
             v_arrival = v.get("arrival_time", "2025-01-01T00:00:00Z")
             v_deadline = v.get("max_departure_time", "2025-12-31T23:59:00Z")
             v_priority = v.get("priority", 3)
             pm = w_priority if v_priority <= 2 else 1.0
 
-            end_h = _iso_to_hours(v_arrival) + handling_h
+            # Find actual start time considering berth occupancy
+            arr_h = _iso_to_hours(v_arrival)
+            actual_start_h = arr_h
+            for (occ_s, occ_e) in berth_occupied.get(bi, []):
+                if occ_s != arr_h and actual_start_h < occ_e and (actual_start_h + 0.1) > occ_s:
+                    actual_start_h = max(actual_start_h, occ_e)
+
+            end_h = actual_start_h + handling_h
             deadline_h = _iso_to_hours(v_deadline)
+            wait_h = max(0, actual_start_h - arr_h)
             delay_h = max(0, end_h - deadline_h)
 
-            cost = (handling_h * assigned_cranes * w_handle +
+            cost = (handling_h * nc * w_handle +
+                    wait_h * w_wait * pm +
                     delay_h * w_delay * pm)
             total_cost += cost
 
-            end_time = _hours_to_iso(end_h, v_arrival)
+            start_time_str = _hours_to_iso(actual_start_h, v_arrival) if wait_h > 0 else v_arrival
+            end_time_str = _hours_to_iso(end_h, v_arrival)
 
             assignments.append({
                 "vessel_id": v["id"],
                 "vessel_name": v_name,
                 "berth_id": b["id"],
-                "start_time": v_arrival,
-                "end_time": end_time,
-                "cranes_assigned": assigned_cranes,
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+                "cranes_assigned": nc,
                 "handling_hours": round(handling_h, 2),
+                "waiting_hours": round(wait_h, 2),
+                "delay_hours": round(delay_h, 2),
                 "cost": round(cost, 2),
                 "priority": v_priority,
-                "teu_volume": v_teu
+                "teu_volume": v_teu,
+                "assignment_source": "sqa" if vi < sqa_assigned else "repair"
             })
         else:
             assignments.append({
@@ -246,14 +410,14 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
                 "cost": 0,
                 "status": "infeasible"
             })
-            logger.warning(f"Vessel {v['id']}: no berth assigned in QUBO solution")
+            logger.warning(f"Vessel {v['id']}: no berth assigned even after repair")
 
     feasible_count = sum(1 for a in assignments if a.get("berth_id") is not None)
     status = "optimal" if feasible_count == n_vessels else (
         "feasible" if feasible_count > 0 else "infeasible"
     )
 
-    # ── 5. Build rich visual output ──────────────────────────────────
+    # ── 8. Build rich visual output ──────────────────────────────────
     # Berth utilization
     total_handling = sum(a.get("handling_hours", 0) for a in assignments)
     end_hours = [_iso_to_hours(a["end_time"]) for a in assignments if a.get("end_time")]
@@ -278,13 +442,20 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         a.get("handling_hours", 0) * a.get("cranes_assigned", 1) * w_handle
         for a in assignments if a.get("berth_id")
     )
-    total_delay_cost = total_cost - total_crane_cost
+    total_wait_cost = sum(
+        a.get("waiting_hours", 0) * w_wait * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
+    total_delay_cost = sum(
+        a.get("delay_hours", 0) * w_delay * (w_priority if a.get("priority", 3) <= 2 else 1.0)
+        for a in assignments if a.get("berth_id")
+    )
 
     # Crane distribution
     crane_distribution = {}
     for a in assignments:
         nc = a.get("cranes_assigned", 0)
-        crane_distribution[nc] = crane_distribution.get(nc, 0) + 1
+        crane_distribution[str(nc)] = crane_distribution.get(str(nc), 0) + 1
 
     # Gantt chart data
     gantt_data = []
@@ -319,16 +490,21 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         p = a.get("priority", 3)
         key = f"P{p}"
         if key not in priority_analysis:
-            priority_analysis[key] = {"count": 0, "total_cost": 0}
+            priority_analysis[key] = {"count": 0, "total_cost": 0, "total_wait_h": 0, "total_delay_h": 0}
         priority_analysis[key]["count"] += 1
         priority_analysis[key]["total_cost"] += a.get("cost", 0)
+        priority_analysis[key]["total_wait_h"] += a.get("waiting_hours", 0)
+        priority_analysis[key]["total_delay_h"] += a.get("delay_hours", 0)
     for key in priority_analysis:
         pa = priority_analysis[key]
         pa["avg_cost"] = round(pa["total_cost"] / max(pa["count"], 1), 2)
         pa["total_cost"] = round(pa["total_cost"], 2)
+        pa["avg_wait_h"] = round(pa["total_wait_h"] / max(pa["count"], 1), 2)
+        pa["avg_delay_h"] = round(pa["total_delay_h"] / max(pa["count"], 1), 2)
 
     elapsed = round(time.time() - start_time, 3)
     logger.info(f"Total cost: {total_cost:.2f}, Status: {status}, Time: {elapsed}s")
+    logger.info(f"Assigned: {feasible_count}/{n_vessels} (SQA: {sqa_assigned}, Repair: {repaired_count})")
 
     return {
         # ── Core assignment result ──
@@ -336,26 +512,29 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "objective_value": round(total_cost, 2),
         "solution_status": status,
 
-        # ── Input size metrics (for benchmarking) ──
+        # ── Input size metrics ──
         "num_vessels": n_vessels,
         "num_berths": n_berths,
         "total_cranes": total_cranes,
 
         # ── Schedule metrics ──
         "schedule_metrics": {
-            "total_waiting_time": 0,
-            "avg_waiting_time": 0,
+            "total_waiting_time": round(sum(a.get("waiting_hours", 0) for a in assignments), 2),
+            "avg_waiting_time": round(sum(a.get("waiting_hours", 0) for a in assignments) / max(n_vessels, 1), 2),
             "makespan": round(makespan, 2),
             "utilization": round(total_handling / max(makespan * n_berths, 1), 4),
             "total_teu_processed": total_teu,
             "feasible_assignments": feasible_count,
-            "infeasible_assignments": n_vessels - feasible_count
+            "infeasible_assignments": n_vessels - feasible_count,
+            "sqa_direct_assignments": sqa_assigned,
+            "repair_assignments": repaired_count
         },
 
         # ── Visual: Cost breakdown (pie/bar chart ready) ──
         "cost_breakdown": {
             "total_cost": round(total_cost, 2),
             "crane_handling_cost": round(total_crane_cost, 2),
+            "waiting_cost": round(total_wait_cost, 2),
             "delay_penalty_cost": round(total_delay_cost, 2),
             "cost_per_vessel": round(total_cost / max(n_vessels, 1), 2),
             "cost_per_teu": round(total_cost / max(total_teu, 1), 4)
@@ -365,6 +544,7 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
         "sqa_convergence": {
             "initial_energy": round(energy_evolution[0]["best_energy"], 2) if energy_evolution else 0,
             "final_energy": round(best_energy, 2),
+            "total_sweeps": n_sweeps,
             "energy_evolution": energy_evolution,
             "temperature_schedule": temperature_schedule
         },
@@ -377,7 +557,14 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "nonzero_entries": len(Q),
             "matrix_density": round(qubo_density, 6),
             "constraint_satisfaction": constraint_satisfaction,
-            "qubo_build_time_s": qubo_build_time
+            "qubo_build_time_s": qubo_build_time,
+            "penalty_scale": {
+                "one_berth": round(penalty_one_berth, 0),
+                "one_crane": round(penalty_one_crane, 0),
+                "infeasible": round(penalty_infeasible, 0),
+                "overlap": round(penalty_overlap, 0),
+                "avg_objective_cost": round(avg_cost, 0)
+            }
         },
 
         # ── Visual: Berth utilization (bar chart ready) ──
@@ -410,7 +597,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "trotter_slices": n_trotter,
             "sqa_time_s": sqa_time,
             "qubo_build_time_s": qubo_build_time,
-            "solver_version": "2.0"
+            "repair_time_s": repair_time,
+            "solver_version": "3.0"
         },
 
         # ── Quantum advantage metrics ──
@@ -420,7 +608,8 @@ def run(input_data: dict, solver_params: dict, extra_arguments: dict) -> dict:
             "hardware_ready": n_vars <= 5000,
             "dwave_compatible": True,
             "estimated_qpu_time_us": n_vars * 20,
-            "classical_equivalent_complexity": f"O({n_vessels}^{n_berths})"
+            "classical_equivalent_complexity": f"O({n_vessels}^{n_berths})",
+            "sqa_vs_greedy_note": f"SQA assigned {sqa_assigned}/{n_vessels} directly; repair filled {repaired_count}"
         },
 
         # ── Platform benchmark contract ──
